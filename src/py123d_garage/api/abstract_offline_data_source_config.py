@@ -27,6 +27,9 @@ class AbstractOfflineDataSourceConfig:
     # Feature cache store of this source; None = no training cache.
     cache_root: str | None = None
 
+    # Optional ordered scene selection; repeated keys repeat training samples.
+    sample_manifest_path: str | None = None
+
     # Time interval the source's logs record past ego states on.
     served_ego_state_interval_us: PositiveInt = MISSING
 

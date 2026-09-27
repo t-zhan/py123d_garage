@@ -41,6 +41,9 @@ def get_target_points(
         InsufficientRouteError: if the log carries no route (reconvert or backfill
             with write_route), or less route remains than the largest distance.
     """
+    if not target_point_distances_m:
+        return np.zeros((0, 2), dtype=np.float32)
+
     initial_ego_state_se3: EgoStateSE3 | None = scene_api.get_ego_state_se3_at_iteration(0)
     assert initial_ego_state_se3 is not None, "Ego state should be available for target-point computation!"
     origin_pose_se2: PoseSE2 = initial_ego_state_se3.rear_axle_se2

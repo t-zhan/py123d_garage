@@ -82,3 +82,21 @@ class CosineAnnealingWarmRestartsWithWarmup(LRScheduler):
             progress = (step - warmup_steps) / max(1, length - warmup_steps)
             scale = (1.0 + math.cos(math.pi * progress)) / 2.0
         return [float(self.eta_min + (base - self.eta_min) * scale) for base in self.base_lrs]
+
+
+class CosineWithWarmup(LRScheduler):
+    def __init__(self, optimizer: torch.optim.Optimizer, total_steps: int, warmup_fraction: float, eta_min: float):
+        self.total_steps = max(1, total_steps)
+        self.warmup_steps = int(self.total_steps * warmup_fraction)
+        self.eta_min = eta_min
+        super().__init__(optimizer)
+
+    @override
+    def get_lr(self) -> list[float]:
+        step = max(0, self.last_epoch)
+        if step < self.warmup_steps:
+            scale = (step + 1) / max(1, self.warmup_steps)
+        else:
+            progress = min(1.0, (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps))
+            scale = (1.0 + math.cos(math.pi * progress)) / 2.0
+        return [float(self.eta_min + (base - self.eta_min) * scale) for base in self.base_lrs]

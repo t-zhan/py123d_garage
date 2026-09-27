@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from omegaconf import MISSING
 
+from py123d_garage.config.schema.policy.impromptu_vla_config import ImpromptuVLAConfig
 from py123d_garage.config.schema.policy.transfuser_config import TransfuserConfig
 from py123d_garage.config.schema.policy.vavam_config import VavamConfig
 
@@ -22,6 +23,7 @@ class PolicyConfig:
 
     # VaVAM's block, read when target names the VavamPolicy.
     vavam_config: VavamConfig | None = None
+    impromptu_vla_config: ImpromptuVLAConfig | None = None
 
     # -- Atomic settings --
 

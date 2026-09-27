@@ -13,7 +13,7 @@ from torch.optim import Optimizer
 from typing_extensions import override
 
 from py123d_garage.api.abstract_policy import AnyPolicy
-from py123d_garage.api.abstract_policy_tensors import AbstractFeatures
+from py123d_garage.api.abstract_policy_tensors import AbstractFeatures, AbstractPredictions
 from py123d_garage.common.config_help import run_dir
 from py123d_garage.config.schema.training.training_config import (
     OptimizerConfig,
@@ -26,6 +26,7 @@ from py123d_garage.training.checkpointing import (
 from py123d_garage.training.dataset import TrainingSample
 from py123d_garage.training.lr_scheduler import (
     CosineAnnealingWarmRestartsWithWarmup,
+    CosineWithWarmup,
 )
 
 LOG = logging.getLogger(__name__)
@@ -126,6 +127,7 @@ class PolicyLightningModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             sync_dist=True,
+            batch_size=len(batch.scene_apis),
         )
         if self._is_scalar_log_step():
             with torch.no_grad():
@@ -146,6 +148,11 @@ class PolicyLightningModule(L.LightningModule):
                 rank_zero_only=True,
             )
         return total_loss
+
+    @override
+    def validation_step(self, batch: TrainingSample, batch_idx: int) -> AbstractPredictions:
+        del batch_idx
+        return self.policy.forward(batch.features, batch.navigation)
 
     def _is_scalar_log_step(self) -> bool:
         """Whether this step is one Lightning writes on_step scalars for; gates the debug logging."""
@@ -245,13 +252,23 @@ class PolicyLightningModule(L.LightningModule):
         total_steps = int(self.trainer.estimated_stepping_batches)
         assert self.trainer.max_epochs is not None, "Trainer must be built with max_epochs set"
         steps_per_epoch = max(1, total_steps // max(1, self.trainer.max_epochs))
-        scheduler = CosineAnnealingWarmRestartsWithWarmup(
-            optimizer,
-            T_0=steps_per_epoch,
-            T_mult=2,
-            warmup_fraction=optimizer_config.lr_warmup_fraction,
-            eta_min=optimizer_config.lr_min,
-        )
+        if optimizer_config.schedule == "cosine":
+            scheduler = CosineWithWarmup(
+                optimizer,
+                total_steps=total_steps,
+                warmup_fraction=optimizer_config.lr_warmup_fraction,
+                eta_min=optimizer_config.lr_min,
+            )
+        elif optimizer_config.schedule == "warm_restarts":
+            scheduler = CosineAnnealingWarmRestartsWithWarmup(
+                optimizer,
+                T_0=steps_per_epoch,
+                T_mult=2,
+                warmup_fraction=optimizer_config.lr_warmup_fraction,
+                eta_min=optimizer_config.lr_min,
+            )
+        else:
+            raise ValueError(f"Unknown LR schedule: {optimizer_config.schedule}")
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},

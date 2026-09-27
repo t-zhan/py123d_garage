@@ -163,7 +163,7 @@ class ThroughputLoggingCallback(L.Callback):
             rank_zero_only=True,
         )
         LOG.info(
-            f"step {trainer.global_step} | {batches_per_second:.2f} batches/s | {samples_per_second:.1f} samples/s",
+            f"batch {batch_idx + 1} | {batches_per_second:.2f} batches/s | {samples_per_second:.1f} samples/s",
         )
         self._window_start = perf_counter()
         self._window_batches = 0

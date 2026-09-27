@@ -33,6 +33,7 @@ from py123d_garage.cache import CacheStoreReader
 from py123d_garage.datatypes.tensor import TensorBundle
 from py123d_garage.datatypes.trajectory import TrajectorySE2
 from py123d_garage.py123d_help.scene_builders import build_scene_builder, find_log_names
+from py123d_garage.py123d_help.scene_builders.sample_manifest import select_manifest_scenes
 
 LOG = logging.getLogger(__name__)
 
@@ -80,6 +81,14 @@ def build_source_scenes(
             executor=executor,
         ),
     )
+    if source.sample_manifest_path:
+        camera_id = py123d_garage_policy.policy_config.required_cameras["nuscenes"][0]
+        scenes = select_manifest_scenes(
+            scenes,
+            source.sample_manifest_path,
+            camera_id,
+            set(shard_log_names),
+        )
     LOG.info(
         f"Source {source.data_root}, shard "
         f"{shard_index}/{num_shards} "

@@ -64,13 +64,14 @@ def verify_policy_against_scene_filter(
             f"the {policy_config.trajectory_horizon_us} µs trajectory horizon: trajectory "
             "labels would be clipped at the scene boundary.",
         )
-    farthest_target_point_m = max(policy_config.required_target_point_distances_m)
-    if scene_filter.min_remaining_route_m is None or scene_filter.min_remaining_route_m < farthest_target_point_m:
-        raise ValueError(
-            f"filter min_remaining_route_m={scene_filter.min_remaining_route_m} cannot "
-            f"reach the farthest target point at {farthest_target_point_m} m: scenes "
-            "whose route falls short would fail per sample.",
-        )
+    if policy_config.required_target_point_distances_m:
+        farthest_target_point_m = max(policy_config.required_target_point_distances_m)
+        if scene_filter.min_remaining_route_m is None or scene_filter.min_remaining_route_m < farthest_target_point_m:
+            raise ValueError(
+                f"filter min_remaining_route_m={scene_filter.min_remaining_route_m} cannot "
+                f"reach the farthest target point at {farthest_target_point_m} m: scenes "
+                "whose route falls short would fail per sample.",
+            )
 
 
 def verify_policy_against_offline_data_source(
@@ -260,6 +261,8 @@ def _verify_policy_against_provider_target_points(
         ValueError: if a distance falls outside the limits.
     """
     distances_m = policy_config.required_target_point_distances_m
+    if not distances_m:
+        return
     if min_distance_m is not None and min(distances_m) < min_distance_m:
         raise ValueError(
             f"the policy needs a target point at {min(distances_m)} m but {provider} "

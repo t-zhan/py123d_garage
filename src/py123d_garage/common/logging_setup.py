@@ -58,18 +58,17 @@ def setup_logging() -> None:
     """Routes INFO logs to stdout; without it the root logger drops them."""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    already_on_stdout = any(getattr(handler, "stream", None) is sys.stdout for handler in root.handlers)
-    if not already_on_stdout:
-        handler = logging.StreamHandler(sys.stdout)
+    stdout_handlers = [handler for handler in root.handlers if getattr(handler, "stream", None) is sys.stdout]
+    if not stdout_handlers:
+        stdout_handlers = [logging.StreamHandler(sys.stdout)]
+        root.addHandler(stdout_handlers[0])
+    for handler in stdout_handlers:
         handler.setFormatter(
             _RepoPathFormatter(
                 "[%(asctime)s][%(levelname)s]%(rank_tag)s[%(pathname)s:%(lineno)d] %(message)s",
             ),
         )
-        # On the handler, so it applies to records propagating up from any
-        # logger, not only those logged through the root one.
         handler.addFilter(_RankFilter())
-        root.addHandler(handler)
     for existing in root.manager.loggerDict.values():
         if isinstance(existing, logging.Logger):
             existing.disabled = False

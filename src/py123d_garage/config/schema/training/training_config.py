@@ -5,6 +5,7 @@ from typing import Any
 
 from py123d_garage.api.abstract_offline_data_source_config import OfflineTrainingDataSourceConfig
 from py123d_garage.config.schema.policy.policy_config import PolicyConfig
+from py123d_garage.config.schema.swanlab_config import SwanLabConfig
 
 
 @dataclass
@@ -47,6 +48,8 @@ class OptimizerConfig:
     # Fused CUDA optimizer kernel; ignored on CPU. Incompatible with trainer-side
     # gradient clipping under mixed precision (the kernel unscales internally).
     fused: bool = False
+    # warm_restarts | cosine
+    schedule: str = "warm_restarts"
 
 
 @dataclass
@@ -65,6 +68,14 @@ class DataLoaderConfig:
     shuffle: bool = True
     # A compiled model wants static shapes.
     drop_last: bool = True
+
+
+@dataclass
+class ValidationConfig:
+    samples_per_rank: int = 100
+    seed: int = 0
+    batch_size: int = 1
+    num_workers: int = 2
 
 
 @dataclass
@@ -98,6 +109,9 @@ class LightningTrainerConfig:
     # Write cadence of on_step scalars; also gates the debug metrics, output
     # min/max, and gradient-norm computation.
     log_every_n_steps: int = 100
+    check_val_every_n_epoch: int = 1
+    val_check_interval: int | float = 1.0
+    num_sanity_val_steps: int = 0
 
 
 @dataclass
@@ -116,12 +130,14 @@ class TrainingConfig:
     dataloader_config: DataLoaderConfig = field(
         default_factory=DataLoaderConfig,
     )
+    validation_config: ValidationConfig | None = None
     # lightning.Trainer kwargs.
     lightning_trainer_config: LightningTrainerConfig = field(
         default_factory=LightningTrainerConfig,
     )
     # W&B streaming.
     wandb_config: WandbConfig = field(default_factory=WandbConfig)
+    swanlab_config: SwanLabConfig = field(default_factory=SwanLabConfig)
 
     # -- Atomic settings --
 

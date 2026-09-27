@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import os
+import random
 import sys
 import traceback
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -24,7 +27,7 @@ from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import DictConfig
 from py123d.api import SceneAPI
 from py123d.api.scene.arrow.arrow_scene_builder import ArrowSceneBuilder
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Subset, WeightedRandomSampler
 
 from py123d_garage.api.abstract_offline_data_source_config import OfflineTrainingDataSourceConfig
 from py123d_garage.api.abstract_policy import AbstractPolicy, AnyPolicy
@@ -41,6 +44,7 @@ from py123d_garage.common.config_help import (
 from py123d_garage.common.logging_setup import log_stage, setup_logging
 from py123d_garage.config.schema.training.training_config import TrainingConfig
 from py123d_garage.py123d_help.scene_builders import VerboseProcessPoolExecutor, build_scene_builder
+from py123d_garage.py123d_help.scene_builders.sample_manifest import select_manifest_scenes
 from py123d_garage.training.callbacks import (
     BatchesProgressBar,
     EpochLoggingCallback,
@@ -55,22 +59,36 @@ LOG = logging.getLogger(__name__)
 
 
 def _build_loggers(training_config: TrainingConfig) -> list[Logger]:
-    """Builds the trainer loggers; W&B is the only logger, empty when disabled."""
+    """Builds enabled Lightning loggers."""
     wandb_config = training_config.wandb_config
-    if not wandb_config.enabled:
-        return []
-    return [
-        WandbLogger(
-            project=wandb_config.project,
-            name=wandb_config.name,
-            save_dir=str(run_dir()),
-            log_model=wandb_config.log_model,
-            entity=wandb_config.entity,
-            group=wandb_config.group,
-            tags=list(wandb_config.tags or []),
-            mode=wandb_config.mode,
-        ),
-    ]
+    loggers: list[Logger] = []
+    if wandb_config.enabled:
+        loggers.append(
+            WandbLogger(
+                project=wandb_config.project,
+                name=wandb_config.name,
+                save_dir=str(run_dir()),
+                log_model=wandb_config.log_model,
+                entity=wandb_config.entity,
+                group=wandb_config.group,
+                tags=list(wandb_config.tags or []),
+                mode=wandb_config.mode,
+            )
+        )
+    swanlab_config = training_config.swanlab_config
+    if swanlab_config.enabled:
+        from swanlab.integration.pytorch_lightning import SwanLabLogger
+
+        loggers.append(
+            SwanLabLogger(
+                project=swanlab_config.project,
+                experiment_name=swanlab_config.name,
+                mode=swanlab_config.mode,
+                log_dir=str(run_dir() / "swanlab"),
+                save_dir=str(run_dir()),
+            )
+        )
+    return loggers
 
 
 def _worker_init(worker_id: int) -> None:
@@ -107,6 +125,9 @@ def _build_source_datasets(
                     max_workers=training_config.startup_num_workers,
                 ),
             )
+        if source.sample_manifest_path:
+            camera_id = policy.policy_config.required_cameras["nuscenes"][0]
+            scenes = select_manifest_scenes(scenes, source.sample_manifest_path, camera_id)
         assert len(scenes), f"source {source.data_root} selected no scenes"
         LOG.info(
             f"Source {source.data_root}: {len(scenes)} scenes passed the filter",
@@ -164,6 +185,57 @@ def _build_sampler(
         per_sample_weights,  # pyright: ignore[reportArgumentType]
         num_samples=len(per_sample_weights),
         replacement=True,
+    )
+
+
+def _build_validation_dataloader(
+    train_data: ConcatDataset[Any],
+    source_datasets: list[TrainingDataset],
+    training_config: TrainingConfig,
+    world_size: int,
+    output_dir: Path,
+    is_global_zero: bool,
+) -> DataLoader[Any]:
+    config = training_config.validation_config
+    assert config is not None
+    total = config.samples_per_rank * world_size
+    indices = list(range(len(train_data)))
+    random.Random(config.seed).shuffle(indices)
+    selected: list[int] = []
+    identities: list[str] = []
+    seen: set[str] = set()
+    for index in indices:
+        source_index = bisect_right(train_data.cumulative_sizes, index)
+        offset = 0 if source_index == 0 else train_data.cumulative_sizes[source_index - 1]
+        identity = str(source_datasets[source_index].scenes[index - offset].scene_uuid)
+        if identity not in seen:
+            selected.append(index)
+            identities.append(identity)
+            seen.add(identity)
+            if len(selected) == total:
+                break
+    if len(selected) != total:
+        raise ValueError(f"Validation needs {total} unique scenes; found {len(selected)}")
+    if is_global_zero:
+        (output_dir / "validation_samples.json").write_text(
+            json.dumps(
+                {
+                    "seed": config.seed,
+                    "samples_per_rank": config.samples_per_rank,
+                    "world_size": world_size,
+                    "scene_uuids": identities,
+                },
+                indent=2,
+            )
+        )
+    LOG.info(f"Validation: {total} unique training scenes, {config.samples_per_rank} per rank")
+    return DataLoader(
+        Subset(train_data, selected),
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=training_config.dataloader_config.pin_memory,
+        worker_init_fn=_worker_init,
+        collate_fn=TrainingSample.collate,
     )
 
 
@@ -248,6 +320,10 @@ def main(cfg: DictConfig) -> None:
     train_data: ConcatDataset[Any] = ConcatDataset(source_datasets)
     LOG.info(f"{len(train_data)} train samples")
     sampler = _build_sampler(source_datasets, training_config.offline_data_sources)
+    world_size = trainer_config.devices * trainer_config.num_nodes if isinstance(trainer_config.devices, int) else 1
+    if world_size > 1 and sampler is None and not training_config.dataloader_config.drop_last:
+        padding = (-len(train_data)) % world_size
+        LOG.info(f"Distributed sampler adds {padding} repeated indices per epoch")
     # batch_size and num_workers are per device.
     dataloader_kwargs = asdict(training_config.dataloader_config)
     if sampler is not None:
@@ -293,9 +369,25 @@ def main(cfg: DictConfig) -> None:
         logger=training_loggers,
         callbacks=callbacks,
     )
+    val_dataloader = None
+    if training_config.validation_config is not None:
+        val_dataloader = _build_validation_dataloader(
+            train_data,
+            source_datasets,
+            training_config,
+            trainer.num_devices * trainer.num_nodes,
+            output_dir,
+            trainer.is_global_zero,
+        )
 
+    hyperparams = asdict(training_config)
+    manifest_root = getattr(policy.policy_config, "sample_manifest_path", None)
+    if manifest_root:
+        provenance_file = Path(manifest_root) / "provenance.json"
+        if provenance_file.is_file():
+            hyperparams["data_and_model_provenance"] = json.loads(provenance_file.read_text())
     for training_logger in training_loggers:
-        training_logger.log_hyperparams(asdict(training_config))
+        training_logger.log_hyperparams(hyperparams)
     if trainer.is_global_zero:
         for source_index, dataset in enumerate(source_datasets):
             _export_sensor_rig(
@@ -319,6 +411,7 @@ def main(cfg: DictConfig) -> None:
         trainer.fit(
             model=lightning_module,
             train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
             ckpt_path=resume,
         )
     except BaseException:
@@ -331,6 +424,10 @@ def main(cfg: DictConfig) -> None:
     LOG.info(
         f"Training finished after {trainer.current_epoch} epochs / {trainer.global_step} global steps",
     )
+    if training_config.swanlab_config.enabled and trainer.is_global_zero:
+        import swanlab
+
+        swanlab.finish()
 
 
 if __name__ == "__main__":
