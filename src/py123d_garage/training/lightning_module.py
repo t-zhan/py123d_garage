@@ -240,7 +240,7 @@ class PolicyLightningModule(L.LightningModule):
 
     @override
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
-        """AdamW with a per-step cosine annealing warm-restart schedule."""
+        """AdamW with the selected per-step learning rate schedule."""
         optimizer_config: OptimizerConfig = self.training_config.optimizer_config
         optimizer = torch.optim.AdamW(
             self.policy.parameters(),
@@ -267,6 +267,17 @@ class PolicyLightningModule(L.LightningModule):
                 warmup_fraction=optimizer_config.lr_warmup_fraction,
                 eta_min=optimizer_config.lr_min,
             )
+        elif optimizer_config.schedule == "warmup_step":
+
+            def scale(step: int) -> float:
+                warmup = optimizer_config.lr_warmup_steps
+                if step < warmup:
+                    return 0.05 + 0.95 * step / warmup
+                return max(
+                    0.01, optimizer_config.lr_step_gamma ** ((step - warmup) // optimizer_config.lr_step_frequency)
+                )
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
         else:
             raise ValueError(f"Unknown LR schedule: {optimizer_config.schedule}")
         return {

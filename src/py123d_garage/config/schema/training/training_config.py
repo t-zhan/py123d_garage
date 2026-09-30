@@ -32,7 +32,7 @@ class WandbConfig:
 
 @dataclass
 class OptimizerConfig:
-    """AdamW; the cosine warm-restart schedule is derived in the training loop."""
+    """AdamW with the learning rate schedule selected in the training loop."""
 
     # Peak learning rate; the cosine schedule decays from it.
     learning_rate: float = 3.0e-4
@@ -48,8 +48,11 @@ class OptimizerConfig:
     # Fused CUDA optimizer kernel; ignored on CPU. Incompatible with trainer-side
     # gradient clipping under mixed precision (the kernel unscales internally).
     fused: bool = False
-    # warm_restarts | cosine
+    # warm_restarts | cosine | warmup_step
     schedule: str = "warm_restarts"
+    lr_warmup_steps: int = 500
+    lr_step_frequency: int = 2000
+    lr_step_gamma: float = 0.98
 
 
 @dataclass

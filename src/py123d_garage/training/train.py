@@ -93,9 +93,9 @@ def _build_loggers(training_config: TrainingConfig) -> list[Logger]:
 
 def _worker_init(worker_id: int) -> None:
     """We parallelize across DataLoader workers."""
-    torch.set_num_threads(1)
     cv2.setNumThreads(0)
     numba.set_num_threads(1)  # pyright: ignore[reportUnknownMemberType]
+    torch.set_num_threads(1)  # Numba resets the shared OpenMP thread count.
     # Our custom worker_init_fn stops Lightning from installing this itself.
     pl_worker_init_function(worker_id)
 
@@ -303,7 +303,7 @@ def main(cfg: DictConfig) -> None:
         )
         policy.initialize()
     LOG.info(
-        f"Policy has {sum(p.numel() for p in policy.parameters()):,} trainable parameters",
+        f"Policy has {sum(p.numel() for p in policy.parameters() if p.requires_grad):,} trainable parameters",
     )
     lightning_module = PolicyLightningModule(
         policy=policy,
@@ -320,7 +320,8 @@ def main(cfg: DictConfig) -> None:
     train_data: ConcatDataset[Any] = ConcatDataset(source_datasets)
     LOG.info(f"{len(train_data)} train samples")
     sampler = _build_sampler(source_datasets, training_config.offline_data_sources)
-    world_size = trainer_config.devices * trainer_config.num_nodes if isinstance(trainer_config.devices, int) else 1
+    resolved_devices = torch.cuda.device_count() if trainer_config.devices == "auto" else trainer_config.devices
+    world_size = resolved_devices * trainer_config.num_nodes if isinstance(resolved_devices, int) else 1
     if world_size > 1 and sampler is None and not training_config.dataloader_config.drop_last:
         padding = (-len(train_data)) % world_size
         LOG.info(f"Distributed sampler adds {padding} repeated indices per epoch")
@@ -356,7 +357,7 @@ def main(cfg: DictConfig) -> None:
 
     training_loggers: list[Logger] = _build_loggers(training_config)
     trainer_kwargs = asdict(training_config.lightning_trainer_config)
-    single_device = trainer_kwargs["devices"] == 1 and trainer_kwargs["num_nodes"] == 1
+    single_device = world_size == 1
     if trainer_kwargs["strategy"] == "auto" and not single_device:
         # Skips DDP's per-forward broadcast of the BatchNorm running statistics; one device needs no DDP.
         trainer_kwargs["strategy"] = DDPStrategy(broadcast_buffers=False)
@@ -381,9 +382,12 @@ def main(cfg: DictConfig) -> None:
         )
 
     hyperparams = asdict(training_config)
+    hyperparams["train_sample_count"] = len(train_data)
     manifest_root = getattr(policy.policy_config, "sample_manifest_path", None)
     if manifest_root:
-        provenance_file = Path(manifest_root) / "provenance.json"
+        provenance_file = Path(
+            getattr(policy.policy_config, "provenance_file", str(Path(manifest_root) / "provenance.json"))
+        )
         if provenance_file.is_file():
             hyperparams["data_and_model_provenance"] = json.loads(provenance_file.read_text())
     for training_logger in training_loggers:
