@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from py123d_garage.api.abstract_benchmark_config import AbstractBenchmarkConfig
-from py123d_garage.config.schema.evaluation.parallel_offline_evaluation_config import ParallelizationConfig
 from py123d_garage.config.schema.policy.policy_config import EvaluationPolicyConfig
+
+
+@dataclass
+class OpenLoopParallelizationConfig:
+    accelerator: str = "auto"
+    devices: int | str = "auto"
+    inference_batch_size: int = 32
+    max_workers: int | None = None
 
 
 @dataclass
@@ -13,9 +20,9 @@ class OpenLoopBenchmarkConfig(AbstractBenchmarkConfig):
 
     # The policy under evaluation; evaluation_checkpoint_file selects its weights.
     policy_config: EvaluationPolicyConfig = field(default_factory=EvaluationPolicyConfig)
-    # Sharding across processes and the resources of this shard.
-    parallelization_config: ParallelizationConfig = field(
-        default_factory=ParallelizationConfig,
+    # Lightning devices and per-process loader resources.
+    parallelization_config: OpenLoopParallelizationConfig = field(
+        default_factory=OpenLoopParallelizationConfig,
     )
 
     # -- Atomic settings --

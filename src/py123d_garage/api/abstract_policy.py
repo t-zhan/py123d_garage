@@ -10,7 +10,6 @@ import numpy.typing as npt
 import torch
 from py123d.api import SceneAPI
 from py123d.api.scene.scene_filter import SceneFilter
-from py123d.datatypes.vehicle_state.ego_state import EgoStateSE3
 from torch import Tensor
 from typing_extensions import override
 
@@ -30,6 +29,7 @@ from py123d_garage.api.contract_verifications import (
 )
 from py123d_garage.cache.codec import TensorCodec
 from py123d_garage.datatypes.trajectory import TrajectorySE2
+from py123d_garage.py123d_help.scene_readers.nuscenes_protocol import trajectory_timestamps
 
 if TYPE_CHECKING:
     import lightning as L
@@ -229,8 +229,8 @@ class AbstractPolicy(
             navigation: single-scene navigation conditioning, unbatched.
 
         Returns:
-            predicted future ego trajectory, relative to the initial ego rear-axle
-            pose (origin at current ego, x forward).
+            predicted future ego trajectory, in the configured protocol's anchor
+            frame (x forward, y left).
         """
         features = self.build_features(scene_api, {}).apply(
             lambda tensor: tensor.unsqueeze(0),
@@ -256,8 +256,8 @@ class AbstractPolicy(
             scene_apis: scene interfaces anchored at their current frame (iteration 0).
 
         Returns:
-            predicted future ego trajectories, each relative to its scene's initial
-            ego rear-axle pose (origin at current ego, x forward).
+            predicted future ego trajectories, each in its scene's configured
+            anchor frame (x forward, y left).
         """
         self.eval()
         device = next(self.parameters()).device
@@ -282,7 +282,7 @@ class AbstractPolicy(
             scene_apis: the scenes the rows belong to, anchored at their current frame.
 
         Returns:
-            one trajectory per scene, relative to its anchor rear-axle pose.
+            one trajectory per scene, in the configured protocol's anchor frame.
         """
         poses_se2_batch = cast(
             npt.NDArray[np.float64],
@@ -306,16 +306,7 @@ class AbstractPolicy(
         # Create timestamps for trajectory points, relative to the scene's initial ego state timestamp.
         trajectories: list[TrajectorySE2] = []
         for batch_index, scene_api in enumerate(scene_apis):
-            ego_state_se3: EgoStateSE3 | None = scene_api.get_ego_state_se3_at_iteration(0)
-            assert ego_state_se3 is not None, "Ego state should be available for trajectory computation!"
-            timestamps: np.ndarray[tuple[int], np.dtype[np.signedinteger]] = (
-                ego_state_se3.timestamp.time_us
-                + np.arange(
-                    1,
-                    num_steps + 1,
-                )
-                * interval_us
-            )
+            timestamps = trajectory_timestamps(scene_api, num_steps, interval_us, self.policy_config.nuscenes_protocol)
             trajectories.append(
                 TrajectorySE2(
                     pose_se2_array=poses_se2_batch[batch_index],

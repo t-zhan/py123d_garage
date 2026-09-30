@@ -89,7 +89,7 @@ dev = [
 ]
 
 [tool.setuptools]
-package-data.py123d_garage = [ "py.typed", "**/*.yaml", "**/*.yml", "**/*.proto", "**/*.xodr.gz", "**/*.ids" ]
+package-data.py123d_garage = [ "py.typed", "**/*.yaml", "**/*.yml", "**/*.proto", "**/*.xodr.gz", "**/*.ids", "**/*.LICENSE" ]
 packages.find.where = [ "src" ]
 
 [tool.uv]

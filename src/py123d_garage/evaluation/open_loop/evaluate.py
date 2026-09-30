@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import os
 from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import hydra
+import lightning as L
 import numpy as np
+import pandas as pd
+import torch.distributed as dist
 from omegaconf import DictConfig
 from py123d.api import SceneAPI
+from py123d.datatypes import CameraID
 from py123d.geometry.geometry_index import PoseSE2Index
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from typing_extensions import override
 
 from py123d_garage.api.abstract_policy import AbstractPolicy, AnyPolicy
 from py123d_garage.api.abstract_policy_config import AbstractPolicyConfig
+from py123d_garage.cache import CacheStoreReader
 from py123d_garage.common.config_help import (
     CONFIG_PATH,
     build_from_string,
@@ -26,16 +35,19 @@ from py123d_garage.common.config_help import (
 from py123d_garage.common.logging_setup import setup_logging
 from py123d_garage.config.presets.python.offline_data_sources.navsim import navtest
 from py123d_garage.config.schema.evaluation.open_loop_config import OpenLoopBenchmarkConfig
-from py123d_garage.config.schema.evaluation.parallel_offline_evaluation_config import ParallelizationConfig
 from py123d_garage.datatypes.trajectory import TrajectorySE2
-from py123d_garage.evaluation.help import (
+from py123d_garage.evaluation.help.scene_inference import (
+    OfflineEvaluationDataset,
+    SceneSample,
+    _collate_scene_samples,
+    _save_scene_views,
     build_source_scenes,
-    merge_results_if_last_shard,
-    run_shard_inference,
-    save_shard_results,
 )
+from py123d_garage.evaluation.help.sharding_help import save_results
+from py123d_garage.evaluation.open_loop.sparse_drive import save_sparse_drive_results, score_sparse_drive
 from py123d_garage.py123d_help.scene_builders import VerboseProcessPoolExecutor
 from py123d_garage.py123d_help.scene_readers.ego_state import sample_ego_se2
+from py123d_garage.py123d_help.scene_readers.sensors import camera_at_anchor
 
 LOG = logging.getLogger(__name__)
 
@@ -45,135 +57,182 @@ register_schema("evaluate_open_loop", OpenLoopBenchmarkConfig)
 
 @hydra.main(config_path=str(CONFIG_PATH), config_name="evaluate_open_loop", version_base=None)
 def main(cfg: DictConfig) -> None:
-    # Setup logging
     setup_logging()
-
-    # Print the C-level stack trace when a worker dies on a fatal signal.
     faulthandler.enable()
-
-    # Compose the benchmark config from the Hydra config and command line overrides.
     benchmark_config: OpenLoopBenchmarkConfig = finalize_evaluation(cfg, OpenLoopBenchmarkConfig, hydra_overrides())
-    output_dir = run_dir()
-
-    # Build the policy from the config
-    py123d_garage_policy = cast(
-        AnyPolicy,
-        build_from_string(benchmark_config.policy_config, AbstractPolicy),
+    parallelization = benchmark_config.parallelization_config
+    model = OpenLoopEvaluationModule(benchmark_config, run_dir())
+    trainer = L.Trainer(
+        accelerator=parallelization.accelerator,
+        devices=parallelization.devices,
+        default_root_dir=str(model.output_dir),
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
     )
+    trainer.predict(model, return_predictions=False)
 
-    # Evaluate default on the navtest source if no sources are provided,
-    # so the entry point can be run without any config.
-    if not benchmark_config.benchmark_offline_data_sources:
-        benchmark_config = replace(
-            benchmark_config,
-            benchmark_offline_data_sources={"navtest": navtest(py123d_garage_policy.policy_config)},
-        )
 
-    # Sanity check sharding config
-    parallelization: ParallelizationConfig = benchmark_config.parallelization_config
-    if not 0 <= parallelization.shard_index < parallelization.num_shards:
-        raise ValueError(
-            f"shard_index {parallelization.shard_index} outside [0, {parallelization.num_shards})",
-        )
+class _IndexedDataset(Dataset[tuple[int, SceneSample]]):
+    def __init__(self, samples: ConcatDataset[SceneSample]) -> None:
+        self.samples = samples
 
-    # One writer only: every shard shares the output dir.
-    if parallelization.shard_index == 0:
-        save_config(benchmark_config)
-    LOG.info(
-        f"Path where all results are stored: {output_dir!s}",
-    )
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    # Verify the policy's config is compatible with the benchmark's sources.
-    py123d_garage_policy.verify_contract(benchmark_config=benchmark_config)
-    scored_horizon_us = py123d_garage_policy.policy_config.trajectory_horizon_us
-    for scored_source in benchmark_config.benchmark_offline_data_sources.values():
-        declared_s = scored_source.garage_scene_filter.future_duration_s
-        if declared_s is None or round(declared_s * 1e6) < scored_horizon_us:
-            raise ValueError(
-                f"the source at '{scored_source.data_root}' authors future_duration_s={declared_s} "
-                f"but the errors cover {scored_horizon_us} µs past each anchor.",
+    @override
+    def __getitem__(self, index: int) -> tuple[int, SceneSample]:
+        return index, self.samples[index]
+
+
+def _collate_indexed_samples(samples: list[tuple[int, SceneSample]]) -> tuple[list[int], SceneSample]:
+    indices, scene_samples = zip(*samples, strict=True)
+    return list(indices), _collate_scene_samples(list(scene_samples))
+
+
+class OpenLoopEvaluationModule(L.LightningModule):
+    def __init__(self, benchmark_config: OpenLoopBenchmarkConfig, output_dir: Path) -> None:
+        super().__init__()
+        self.policy = cast(AnyPolicy, build_from_string(benchmark_config.policy_config, AbstractPolicy))
+        if not benchmark_config.benchmark_offline_data_sources:
+            benchmark_config = replace(
+                benchmark_config,
+                benchmark_offline_data_sources={"navtest": navtest(self.policy.policy_config)},
             )
-
-    max_workers = parallelization.max_workers
-    if max_workers is None:
-        # os.cpu_count sees the whole node; the affinity set is the allocation.
-        max_workers = len(os.sched_getaffinity(0))
-    executor = VerboseProcessPoolExecutor(max_workers=max_workers)
-
-    # Un-initialized copy for the loader workers.
-    # This policy object does not have Torch tensors on the device, and is not used for inference.
-    py123d_garage_feature_policy = cast(
-        AnyPolicy,
-        build_from_string(benchmark_config.policy_config, AbstractPolicy),
-    )
-
-    # Initialize the inference policy's weight and move it to the device, so the workers can use it for inference.
-    py123d_garage_policy.initialize(
-        benchmark_config.policy_config.evaluation_checkpoint_file,
-    )
-    py123d_garage_policy.to(parallelization.device)
-
-    # Run the inferences and score the results, one shard at a time.
-    # Each worker loads its own scenes and runs inference on them.
-    results: list[dict[str, object]] = []
-    for source in benchmark_config.benchmark_offline_data_sources.values():
-        scenes = build_source_scenes(
-            source,
-            parallelization.shard_index,
-            parallelization.num_shards,
-            executor,
-            py123d_garage_policy,
+        self.benchmark_config = benchmark_config
+        self.output_dir = output_dir
+        self.scenes: list[SceneAPI] = []
+        self.sample_tokens: list[str] = []
+        self.results: list[tuple[int, dict[str, object]]] = []
+        self.save_visualizations = (
+            benchmark_config.save_visualizations and self.policy.policy_config.nuscenes_protocol != "sparse_drive"
         )
-        LOG.info("Running Inference")
-        trajectories = run_shard_inference(
-            scenes,
-            py123d_garage_policy,
-            py123d_garage_feature_policy,
-            source.cache_root,
-            parallelization.inference_batch_size,
-            max_workers,
-            output_dir / "visualizations" if benchmark_config.save_visualizations else None,
-        )
-        LOG.info("Running Scoring")
-        results.extend(_score_scenes(scenes, trajectories, py123d_garage_policy.policy_config))
+        workers = benchmark_config.parallelization_config.max_workers
+        self.max_workers = workers if workers is not None else len(os.sched_getaffinity(0))
 
-    # Save the shard's results and merge them if this is the last shard to finish.
-    save_shard_results(results, str(output_dir), parallelization.shard_index)
-    merge_results_if_last_shard(
-        str(output_dir),
-        parallelization.num_shards,
-        parallelization.shard_index,
-    )
+    @override
+    def setup(self, stage: str) -> None:
+        self.output_dir = Path(self.trainer.strategy.broadcast(str(self.output_dir)))
+        if self.trainer.is_global_zero:
+            save_config(self.benchmark_config)
+            LOG.info(f"Path where all results are stored: {self.output_dir}")
+        self.policy.verify_contract(benchmark_config=self.benchmark_config)
+        feature_policy = cast(AnyPolicy, build_from_string(self.benchmark_config.policy_config, AbstractPolicy))
+        datasets: list[OfflineEvaluationDataset] = []
+        executor = VerboseProcessPoolExecutor(max_workers=self.max_workers)
+        for source in self.benchmark_config.benchmark_offline_data_sources.values():
+            scenes = build_source_scenes(source, executor, self.policy)
+            self.scenes.extend(scenes)
+            if self.policy.policy_config.nuscenes_protocol == "sparse_drive":
+                rows = [
+                    json.loads(line) for line in Path(cast(str, source.sample_manifest_path)).read_text().splitlines()
+                ]
+                tokens = {(row["scene_name"], row["timestamp_us"]): row["id"] for row in rows}
+                self.sample_tokens.extend(
+                    tokens[(scene.log_name, camera_at_anchor(scene, CameraID.PCAM_F0).timestamp.time_us)]
+                    for scene in scenes
+                )
+            cache_reader = (
+                CacheStoreReader(source.cache_root, self.policy.cache_signature(scenes[0].scene_metadata.dataset))
+                if source.cache_root is not None
+                else None
+            )
+            datasets.append(
+                OfflineEvaluationDataset(scenes, feature_policy, cache_reader, build_labels=self.save_visualizations)
+            )
+        executor._terminate()
+        self.dataset = _IndexedDataset(ConcatDataset(datasets))
+        self.policy.initialize(self.benchmark_config.policy_config.evaluation_checkpoint_file)
+
+    @override
+    def predict_dataloader(self) -> DataLoader[tuple[int, SceneSample]]:
+        return DataLoader(
+            self.dataset,
+            batch_size=self.benchmark_config.parallelization_config.inference_batch_size,
+            num_workers=self.max_workers,
+            collate_fn=_collate_indexed_samples,
+            pin_memory=self.device.type != "cpu",
+        )
+
+    @override
+    def predict_step(self, batch: tuple[list[int], SceneSample], batch_idx: int) -> list[dict[str, object]]:
+        indices, (features, labels, navigation) = batch
+        scenes = [self.scenes[index] for index in indices]
+        predictions = self.policy(features, navigation)
+        trajectories = self.policy.trajectories_from_predictions(predictions, scenes)
+        parse_success = getattr(predictions, "parse_success", None)
+        parsed = parse_success.tolist() if parse_success is not None else [True] * len(scenes)
+        scores = _score_scenes(scenes, trajectories, self.policy.policy_config, parsed)
+        self.results.extend(zip(indices, scores, strict=True))
+        if self.save_visualizations:
+            _save_scene_views(
+                self.policy,
+                features.to("cpu"),
+                labels.to("cpu") if labels is not None else None,
+                navigation.to("cpu"),
+                predictions.to("cpu"),
+                scenes,
+                self.output_dir / "visualizations",
+            )
+        return scores
+
+    @override
+    def on_predict_epoch_end(self) -> None:
+        rank_results: list[list[tuple[int, dict[str, object]]]] = [self.results]
+        if self.trainer.world_size > 1:
+            rank_results = [[] for _ in range(self.trainer.world_size)]
+            dist.all_gather_object(rank_results, self.results)  # pyright: ignore[reportUnknownMemberType]
+        if self.trainer.is_global_zero:
+            ordered = sorted((item for results in rank_results for item in results), key=lambda item: item[0])
+            if self.policy.policy_config.nuscenes_protocol == "sparse_drive":
+                save_sparse_drive_results(
+                    [(self.sample_tokens[index], score) for index, score in ordered],
+                    self.output_dir,
+                    self.benchmark_config.policy_config.evaluation_checkpoint_file,
+                    len(self.dataset),
+                )
+            else:
+                save_results(pd.DataFrame([score for _, score in ordered]), str(self.output_dir))
 
 
 def _score_scenes(
     scenes: list[SceneAPI],
     trajectories: list[TrajectorySE2],
     policy_config: AbstractPolicyConfig,
+    parse_success: list[bool],
 ) -> list[dict[str, object]]:
     """
-    Computes the average and final displacement error of every scene.
+    Computes each scene's metrics under the configured trajectory protocol.
 
     Args:
-        scenes: the shard's scenes, in inference order.
+        scenes: the scenes, in inference order.
         trajectories: the predicted trajectory of each scene, ego-relative.
         policy_config: provides the trajectory grid the errors are scored on.
+        parse_success: whether each prediction contains a complete trajectory.
 
     Returns:
         one metric dict per scene.
     """
     results: list[dict[str, object]] = []
-    for scene, trajectory in zip(scenes, trajectories, strict=True):
+    for scene, trajectory, parsed in zip(scenes, trajectories, parse_success, strict=True):
         result: dict[str, object] = {"scene_uuid": scene.scene_uuid}
         try:
-            result.update(
-                _compute_displacement_errors(
+            if policy_config.nuscenes_protocol == "sparse_drive":
+                result["parse_success"] = parsed
+                metrics = score_sparse_drive(
+                    scene,
+                    trajectory.pose_se2_array[:, :2] if parsed else None,
+                    policy_config.trajectory_num_steps,
+                    policy_config.trajectory_interval_us,
+                )
+            else:
+                metrics = _compute_displacement_errors(
                     scene,
                     trajectory,
                     policy_config.trajectory_num_steps,
                     policy_config.trajectory_interval_us,
-                ),
-            )
+                )
+            result.update(metrics)
         except Exception as error:
             result["scoring_error"] = f"{type(error).__name__}: {error}"
             LOG.warning(

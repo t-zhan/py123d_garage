@@ -42,20 +42,21 @@ BundleT = TypeVar("BundleT", bound=TensorBundle)
 
 def build_source_scenes(
     source: AbstractOfflineDataSourceConfig,
-    shard_index: int,
-    num_shards: int,
     executor: Executor,
     py123d_garage_policy: AnyPolicy,
+    *,
+    shard_index: int = 0,
+    num_shards: int = 1,
 ) -> list[SceneAPI]:
     """
     Builds this shard's slice of one source's benchmark scenes.
 
     Args:
         source: the dataset to read.
-        shard_index: this process's slice of the source's logs.
-        num_shards: how many slices the source's logs are cut into.
         executor: worker pool for scene building.
         py123d_garage_policy: the policy the scenes will feed; refuses an unservable filter.
+        shard_index: this process's slice of the source's logs.
+        num_shards: how many slices the source's logs are cut into.
 
     Returns:
         the shard's scenes of this source.
@@ -90,8 +91,7 @@ def build_source_scenes(
             set(shard_log_names),
         )
     LOG.info(
-        f"Source {source.data_root}, shard "
-        f"{shard_index}/{num_shards} "
+        f"Source {source.data_root} "
         f"({len(shard_log_names)}/{len(log_names)} logs): "
         f"{len(scenes)} scenes passed the filter",
     )

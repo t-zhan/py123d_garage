@@ -1,4 +1,4 @@
-"""The per-scene results table every offline benchmark writes: one file per shard, merged by the last one."""
+"""Per-scene CSV results and legacy shard merging."""
 
 from __future__ import annotations
 
@@ -88,6 +88,11 @@ def merge_results_if_last_shard(
     LOG.info(
         f"{len(df)} scenes passed the filter across all shards",
     )
+    save_results(df, output_dir, shard_index)
+
+
+def save_results(df: pd.DataFrame, output_dir: str, writer_index: int = 0) -> None:
+    """Writes per-scene metrics and their average row."""
     num_unscorable = int(df["scoring_error"].notna().sum()) if "scoring_error" in df else 0
     if num_unscorable:
         LOG.warning(
@@ -102,8 +107,8 @@ def merge_results_if_last_shard(
 
     results_file = Path(output_dir) / "results.csv"
     temporary_file = results_file.with_name(
-        f"results.csv.{shard_index:05d}.tmp",
+        f"results.csv.{writer_index:05d}.tmp",
     )
     df.to_csv(temporary_file, index=False)
     temporary_file.replace(results_file)
-    LOG.info(f"Merged {len(shard_files)} shard results into {results_file}")
+    LOG.info(f"Saved results to {results_file}")

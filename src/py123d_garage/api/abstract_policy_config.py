@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
+from enum import Enum
 
 from omegaconf import MISSING
 from py123d.datatypes import CameraID, LidarID
 
 from py123d_garage.datatypes.numerics import NonNegativeInt, PositiveFloat, PositiveInt
+
+
+class NuScenesProtocol(str, Enum):
+    garage = "garage"
+    sparse_drive = "sparse_drive"
 
 
 @dataclass
@@ -21,6 +27,8 @@ class AbstractPolicyConfig(abc.ABC):
 
     # Distances along the intended route at which the target points are placed.
     required_target_point_distances_m: list[PositiveFloat] = MISSING
+
+    nuscenes_protocol: NuScenesProtocol = NuScenesProtocol.garage
 
     @property
     @abc.abstractmethod
@@ -58,7 +66,7 @@ class AbstractPolicyConfig(abc.ABC):
         How many poses the predicted trajectory holds, derived from the physical fields.
 
         Returns:
-            the number of poses, the first at trajectory_interval_us and the last at trajectory_horizon_us.
+            the number of poses; SparseDrive uses this count on the actual keyframe timestamps.
 
         Raises:
             ValueError: if the horizon is not a whole number of intervals.

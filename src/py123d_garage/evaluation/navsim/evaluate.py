@@ -99,10 +99,10 @@ def main(cfg: DictConfig) -> None:
     for source in benchmark_config.benchmark_offline_data_sources.values():
         scenes = build_source_scenes(
             source,
-            parallelization.shard_index,
-            parallelization.num_shards,
             executor,
             py123d_garage_policy,
+            shard_index=parallelization.shard_index,
+            num_shards=parallelization.num_shards,
         )
         LOG.info("Running Inference")
         trajectories = run_shard_inference(
